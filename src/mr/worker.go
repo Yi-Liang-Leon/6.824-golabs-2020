@@ -1,10 +1,15 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"log"
 	"net/rpc"
+	"os"
+	"sort"
+	"strings"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -12,6 +17,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -25,39 +38,93 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	var tempfiles []*os.File
 
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
+	for {
+		task := Task{}
+		if !call("Master.Request", 0, &task) {
+			return
+		}
+		switch task.Mode {
+		case 1: // map task
+			// map
+			content, _ := os.ReadFile(task.MapSource)
+			kva := mapf(task.MapSource, string(content))
 
-}
+			// split intermediates
+			intermediates := make([][]KeyValue, task.NReduce)
+			for _, kv := range kva {
+				hash := ihash(kv.Key) % task.NReduce
+				intermediates[hash] = append(intermediates[hash], kv)
+			}
 
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
+			// write intermediates to temporary files
+			tempfiles = make([]*os.File, task.NReduce)
+			for i, intermediate := range intermediates {
+				filename := fmt.Sprintf("mr-%d-%d", task.Number, i)
+				tempfiles[i], _ = os.CreateTemp(".", filename+"_*")
+				defer tempfiles[i].Close()
+				enc := json.NewEncoder(tempfiles[i])
+				for _, kv := range intermediate {
+					enc.Encode(kv)
+				}
+			}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+		case 2: // reduce task
+			intermediate := make([]KeyValue, 0)
 
-	// fill in the argument(s).
-	args.X = 99
+			// read intermediate from files
+			for _, reduceSource := range task.ReduceSources {
+				file, _ := os.Open(reduceSource)
+				defer file.Close()
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					intermediate = append(intermediate, kv)
+				}
+			}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+			// reduce
+			sort.Sort(ByKey(intermediate))
+			i := 0
+			filename := fmt.Sprintf("mr-out-%d", task.Number)
+			file, _ := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, os.FileMode(0666))
+			defer file.Close()
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
 
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+				fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
 
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+				i = j
+			}
+		default:
+			return
+
+		}
+		// rename temp file
+		for _, tempfile := range tempfiles {
+			os.Rename(tempfile.Name(), strings.Split(tempfile.Name(), "_")[0]) // remove suffix
+		}
+		call("Master.OK", task, nil)
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // send an RPC request to the master, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
@@ -66,10 +133,5 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
+	return err == nil
 }
