@@ -3,4 +3,6 @@ api.key
 *-handin.tar.gz
 go.mod
 go.work
+go.sum
+raft.log
 mr-*

@@ -19,8 +19,12 @@ package raft
 
 import (
 	"lab/src/labrpc"
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // import "bytes"
@@ -35,10 +39,26 @@ import (
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
+
+type state int
+
+const (
+	follower state = iota
+	candidate
+	leader
+	minTimeout int          = 200 // Milliseconds
+	maxTimeout int          = 400
+	logLevel   logrus.Level = logrus.DebugLevel
+)
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+}
+
+type LogEntry struct {
+	term int
 }
 
 // A Go object implementing a single Raft peer.
@@ -53,16 +73,36 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state on ALL servers
+	currentTerm int        // Latest term server has seen
+	votedFor    any        // CandidateId that received vote in current term
+	log         []LogEntry // Log entries
+	state       state      // Follower, candidate or leader
+
+	// Volatile state on ALL servers
+	commitIndex int // Index of highest log entry known to be committed
+	lastApplied int // Index of highest log entry applied to state machine
+
+	// Volatile state on LEADERs (reinitialized after election)
+	nextIndex  []int // For each server, index of the next log entry to send
+	matchindex []int // For each server, index of highest log entry known to be replicated on server
+
+	// Re-election Logic
+	electionTimeout time.Duration // Randomly picked during election
+	turnLeaderCh    chan struct{}
+	turnFollowerCh  chan struct{} // Term is passed through this channel
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
+func (rf *Raft) GetState() (term int, isLeader bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	rf.mu.Unlock()
+	term = rf.currentTerm
+	isLeader = (rf.state == leader)
+	return
 }
 
 // save Raft's persistent state to stable storage,
@@ -103,17 +143,31 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int // Candidate's term
+	CandidateID  int // Candidate requesting vote
+	LastLogIndex int // Index of last log entry
+	LastLogTerm  int // Term of last log entry
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  // currentTerm for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+	if rf.currentTerm <= args.Term && rf.votedFor == nil {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateID
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -144,7 +198,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	logrus.Debugf("%d(%d): Sending RequestVote to %d", rf.me, rf.currentTerm, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	logrus.Debugf("%d(%d): Received RequestVote from %d (%t)", rf.me, rf.currentTerm, server, ok)
 	return ok
 }
 
@@ -206,9 +262,96 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	initLog()
+	rf.electionTimeout = newTimeout()
+	rf.turnFollowerCh = make(chan struct{}, 1)
+	rf.turnLeaderCh = make(chan struct{}, 1)
+
+	// Election goroutine
+	go rf.electionLogic()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+func (rf *Raft) electionLogic() {
+	for {
+		select {
+		case <-rf.turnFollowerCh:
+			rf.mu.Lock()
+			logrus.Debugf("%d(%d): Turn follower", rf.me, rf.currentTerm)
+			rf.state = follower
+			rf.mu.Unlock()
+		case <-rf.turnLeaderCh:
+			rf.mu.Lock()
+			logrus.Debugf("%d(%d): Turn leader", rf.me, rf.currentTerm)
+			rf.state = leader
+			rf.mu.Unlock()
+		case <-time.After(rf.electionTimeout):
+			logrus.Debugf("%d(%d): Timeout!", rf.me, rf.currentTerm)
+			if rf.state != leader {
+				rf.startElection()
+			}
+		}
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	logrus.Debugf("%d(%d): Starting election", rf.me, rf.currentTerm+1)
+	rf.electionTimeout = newTimeout()
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	var args RequestVoteArgs
+	// Init RequestVoteArgs, same args for all vote requests
+	if len(rf.log) > 0 {
+		args = RequestVoteArgs{
+			rf.currentTerm,
+			rf.me,
+			len(rf.log) - 1,
+			rf.log[len(rf.log)-1].term,
+		}
+	} else {
+		args = RequestVoteArgs{
+			rf.currentTerm,
+			rf.me,
+			0,
+			0,
+		}
+	}
+
+	// Sending out vote request
+	voteCh := make(chan struct{}, len(rf.peers))
+	voteNum := 1 // One vote from self
+	for i := range rf.peers {
+		if i != rf.me {
+			go func() {
+				reply := RequestVoteReply{}
+				rf.sendRequestVote(i, &args, &reply)
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.votedFor = nil
+					rf.turnFollowerCh <- struct{}{}
+				} else if reply.VoteGranted {
+					voteCh <- struct{}{}
+				}
+			}()
+		}
+	}
+	for range voteCh {
+		voteNum++
+		logrus.Debugf("%d(%d): Received %d/%d votes", rf.me, rf.currentTerm, voteNum, len(rf.peers))
+		if voteNum >= len(rf.peers)/2+1 {
+			logrus.Debugf("%d(%d): Win vote! Turning into leader...", rf.me, rf.currentTerm)
+			rf.turnLeaderCh <- struct{}{}
+			return
+		}
+	}
+}
+
+func newTimeout() time.Duration {
+	return time.Duration(rand.Intn(maxTimeout-minTimeout)+minTimeout) * time.Millisecond
 }
