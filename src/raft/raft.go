@@ -46,9 +46,10 @@ const (
 	follower state = iota
 	candidate
 	leader
-	minTimeout int          = 200 // Milliseconds
-	maxTimeout int          = 400
-	logLevel   logrus.Level = logrus.DebugLevel
+	minTimeout       int          = 200 // Milliseconds
+	maxTimeout       int          = 400
+	heartbeatTimeout int          = 150
+	logLevel         logrus.Level = logrus.InfoLevel
 )
 
 type ApplyMsg struct {
@@ -58,7 +59,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term int
+	Term int
 }
 
 // A Go object implementing a single Raft peer.
@@ -88,9 +89,14 @@ type Raft struct {
 	matchindex []int // For each server, index of highest log entry known to be replicated on server
 
 	// Re-election Logic
+	electionTimer   *time.Timer
 	electionTimeout time.Duration // Randomly picked during election
 	turnLeaderCh    chan struct{}
 	turnFollowerCh  chan struct{} // Term is passed through this channel
+
+	// Heartbeat Logic
+	heartbeatTimer   *time.Timer // Should be reset upon elected, and stopped when turning into follower
+	heartbeatTimeout time.Duration
 }
 
 // return currentTerm and whether this server
@@ -99,7 +105,7 @@ func (rf *Raft) GetState() (term int, isLeader bool) {
 
 	// Your code here (2A).
 	rf.mu.Lock()
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 	term = rf.currentTerm
 	isLeader = (rf.state == leader)
 	return
@@ -164,7 +170,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	if rf.currentTerm <= args.Term && rf.votedFor == nil {
+	if (rf.currentTerm == args.Term && rf.votedFor == nil) || (rf.currentTerm < args.Term) {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
 	}
@@ -199,8 +205,51 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	logrus.Debugf("%d(%d): Sending RequestVote to %d", rf.me, rf.currentTerm, server)
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	logrus.Debugf("%d(%d): Received RequestVote from %d (%t)", rf.me, rf.currentTerm, server, ok)
+
+	rf.mu.Unlock()
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply) // Put RPC call outside the critical zone for async IO
+	rf.mu.Lock()
+
+	logrus.Debugf("%d(%d): Received RequestVote from %d (%t)", rf.me, rf.currentTerm, server, reply.VoteGranted)
+	return ok
+}
+
+// Append entries and heartbeat RPC
+type AppendEntriesArgs struct {
+	Term         int        // Leader's term
+	LeaderId     int        // To redirect followers
+	PrevLogIndex int        // Index of log entry immediately preceding new ones
+	PrevLogTerm  int        // Term of PrevLogIndex entry
+	Entries      []LogEntry // Log entries to store
+	LeaderCommit int        // Leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term    int  // Current term, for leader to update
+	Success bool // True if follower contained entry matching PrevLogIndex and PrevLogTerm
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	logrus.Debugf("%d(%d): Received AppendEntries", rf.me, rf.currentTerm)
+	rf.electionTimer.Reset(rf.electionTimeout)
+	reply.Term = rf.currentTerm
+	reply.Success = false
+	if args.Term < rf.currentTerm {
+		return
+	}
+	rf.currentTerm = args.Term
+	if rf.state != follower {
+		rf.turnFollowerCh <- struct{}{}
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	logrus.Debugf("%d(%d): Sending AppendEntries to %d", rf.me, rf.currentTerm, server)
+	rf.mu.Unlock()
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	rf.mu.Lock()
 	return ok
 }
 
@@ -264,11 +313,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	initLog()
 	rf.electionTimeout = newTimeout()
+	rf.electionTimer = time.NewTimer(rf.electionTimeout)
 	rf.turnFollowerCh = make(chan struct{}, 1)
 	rf.turnLeaderCh = make(chan struct{}, 1)
+	rf.heartbeatTimer = time.NewTimer(time.Hour)
+	rf.heartbeatTimer.Stop() // Stopped when init. Only invoked when turning into leader
+	rf.heartbeatTimeout = time.Duration(heartbeatTimeout) * time.Millisecond
 
-	// Election goroutine
-	go rf.electionLogic()
+	go rf.stateHandler()
+
+	go rf.electionHandler()
+
+	// Heartbeat goroutine
+	go rf.heartbeatHandler()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -276,31 +333,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) electionLogic() {
+func (rf *Raft) stateHandler() {
 	for {
 		select {
 		case <-rf.turnFollowerCh:
 			rf.mu.Lock()
 			logrus.Debugf("%d(%d): Turn follower", rf.me, rf.currentTerm)
 			rf.state = follower
+			rf.electionTimer.Reset(rf.electionTimeout)
+			rf.heartbeatTimer.Stop()
 			rf.mu.Unlock()
 		case <-rf.turnLeaderCh:
 			rf.mu.Lock()
 			logrus.Debugf("%d(%d): Turn leader", rf.me, rf.currentTerm)
 			rf.state = leader
+			rf.electionTimer.Stop()
+			rf.heartbeatTimer.Reset(0) // Immediately send heartbeat
 			rf.mu.Unlock()
-		case <-time.After(rf.electionTimeout):
-			logrus.Debugf("%d(%d): Timeout!", rf.me, rf.currentTerm)
-			if rf.state != leader {
-				rf.startElection()
-			}
 		}
 	}
 }
 
+func (rf *Raft) electionHandler() {
+	for range rf.electionTimer.C {
+		rf.mu.Lock()
+		if rf.state != leader {
+			rf.startElection()
+		}
+		rf.electionTimer.Reset(rf.electionTimeout)
+		rf.mu.Unlock()
+	}
+}
+
 func (rf *Raft) startElection() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	logrus.Debugf("%d(%d): Starting election", rf.me, rf.currentTerm+1)
 	rf.electionTimeout = newTimeout()
 	rf.currentTerm++
@@ -312,7 +377,7 @@ func (rf *Raft) startElection() {
 			rf.currentTerm,
 			rf.me,
 			len(rf.log) - 1,
-			rf.log[len(rf.log)-1].term,
+			rf.log[len(rf.log)-1].Term,
 		}
 	} else {
 		args = RequestVoteArgs{
@@ -323,12 +388,14 @@ func (rf *Raft) startElection() {
 		}
 	}
 
-	// Sending out vote request
+	// Send out vote request
 	voteCh := make(chan struct{}, len(rf.peers))
 	voteNum := 1 // One vote from self
 	for i := range rf.peers {
 		if i != rf.me {
 			go func() {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				reply := RequestVoteReply{}
 				rf.sendRequestVote(i, &args, &reply)
 				if reply.Term > rf.currentTerm {
@@ -341,13 +408,50 @@ func (rf *Raft) startElection() {
 			}()
 		}
 	}
-	for range voteCh {
-		voteNum++
-		logrus.Debugf("%d(%d): Received %d/%d votes", rf.me, rf.currentTerm, voteNum, len(rf.peers))
-		if voteNum >= len(rf.peers)/2+1 {
-			logrus.Debugf("%d(%d): Win vote! Turning into leader...", rf.me, rf.currentTerm)
-			rf.turnLeaderCh <- struct{}{}
-			return
+
+	// Collect vote results
+	go func() {
+		for range voteCh {
+			voteNum++
+			logrus.Debugf("%d(%d): Received %d/%d votes", rf.me, rf.currentTerm, voteNum, len(rf.peers))
+			if voteNum >= len(rf.peers)/2+1 {
+				logrus.Debugf("%d(%d): Win vote! Turning into leader...", rf.me, rf.currentTerm)
+				rf.turnLeaderCh <- struct{}{}
+				return
+			}
+		}
+	}()
+}
+
+func (rf *Raft) heartbeatHandler() {
+	for range rf.heartbeatTimer.C {
+		rf.mu.Lock()
+		rf.startHeartbeat()
+		rf.heartbeatTimer.Reset(rf.heartbeatTimeout)
+		rf.mu.Unlock()
+	}
+
+}
+
+func (rf *Raft) startHeartbeat() {
+	if rf.state == leader {
+		args := AppendEntriesArgs{
+			rf.currentTerm,
+			rf.me,
+			0,
+			0,
+			nil,
+			0,
+		}
+		for i := range rf.peers {
+			if i != rf.me {
+				go func() {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					reply := AppendEntriesReply{}
+					rf.sendAppendEntries(i, &args, &reply)
+				}()
+			}
 		}
 	}
 }
