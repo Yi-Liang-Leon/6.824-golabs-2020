@@ -28,20 +28,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 	if rf.currentTerm > args.Term { // If call from an older candidate, reply false
 		return
 	} else if rf.currentTerm < args.Term { // If call from a newer candidate, update term
 		rf.currentTerm = args.Term
-		rf.votedFor = nil
+		rf.votedFor = -1
 	}
 	if rf.isNewerThan(args.LastLogIndex, args.LastLogTerm) { // If this is newer than candidate, reply false
 		return
 	}
-	if rf.votedFor == nil || rf.votedFor == args.CandidateID {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateID {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID
+		rf.electionTimer.Reset(rf.electionTimeout)
 	}
 }
 
@@ -73,31 +75,37 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.DebugLog("sendRequestVote(%d,%v)", server, *args)
+	rf.DebugLogNoLock("sendRequestVote(%d,%v)", server, *args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply) // Put RPC call outside the critical zone for async IO
-	rf.DebugLog("Received RequestVote from %d (%t)", server, reply.VoteGranted)
+	rf.DebugLogNoLock("Received RequestVote from %d (%t)", server, reply.VoteGranted)
 	return ok
 }
 
 func (rf *Raft) electionHandler() {
-	for range rf.electionTimer.C {
-		rf.mu.Lock()
-		if rf.state != leader {
-			rf.mu.Unlock()
-			rf.startElection()
+	for {
+		select {
+		case <-rf.electionTimer.C:
 			rf.mu.Lock()
+			if rf.state != leader {
+				rf.mu.Unlock()
+				rf.startElection()
+				rf.mu.Lock()
+			}
+			rf.electionTimer.Reset(rf.electionTimeout)
+			rf.mu.Unlock()
+		case <-rf.killSig:
+			return
 		}
-		rf.electionTimer.Reset(rf.electionTimeout)
-		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) startElection() {
-	rf.DebugLog("startElection()")
+	rf.DebugLogNoLock("startElection()")
 	rf.mu.Lock()
 	rf.electionTimeout = newTimeout()
 	rf.currentTerm++
 	rf.votedFor = rf.me
+	rf.state = candidate
 	var args RequestVoteArgs
 	// Init RequestVoteArgs, same args for all vote requests
 	if len(rf.log) > 0 {
@@ -115,6 +123,7 @@ func (rf *Raft) startElection() {
 			0,
 		}
 	}
+	rf.persist()
 	rf.mu.Unlock()
 
 	// Send out vote request
@@ -125,7 +134,9 @@ func (rf *Raft) startElection() {
 		if i != rf.me {
 			go func() {
 				reply := RequestVoteReply{}
-				rf.sendRequestVote(i, &args, &reply)
+				if !rf.sendRequestVote(i, &args, &reply) {
+					return
+				}
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
@@ -134,6 +145,7 @@ func (rf *Raft) startElection() {
 					voteNum.Add(1)
 				}
 				doneCh <- struct{}{}
+				rf.persist()
 				rf.mu.Unlock()
 			}()
 		}
@@ -146,18 +158,18 @@ func (rf *Raft) startElection() {
 		for {
 			select {
 			case <-doneCh:
-				rf.DebugLog("Received %d/%d votes", voteNum.Load(), len(rf.peers))
+				rf.DebugLogNoLock("Received %d/%d votes", voteNum.Load(), len(rf.peers))
 				doneTaskNum++
 				if int(voteNum.Load()) >= len(rf.peers)/2+1 {
 					rf.turnLeaderCh <- struct{}{}
-					rf.DebugLog("Win vote! Turning into leader...")
+					rf.DebugLogNoLock("Win vote! Turning into leader...")
 					return
 				}
 				if doneTaskNum >= len(rf.peers)-1 {
 					return
 				}
 			case <-timeout:
-				rf.DebugLog("Election timeout!")
+				rf.DebugLogNoLock("Election timeout!")
 				return
 			}
 		}

@@ -4,5 +4,8 @@ api.key
 go.mod
 go.work
 go.sum
-raft.log
 mr-*
+*.sh
+*.log
+*.err
+tester

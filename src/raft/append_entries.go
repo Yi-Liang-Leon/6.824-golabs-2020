@@ -15,7 +15,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.DebugLog("AppendEntries(%v)", *args)
+	rf.DebugLogNoLock("AppendEntries(%v)", *args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.electionTimer.Reset(rf.electionTimeout)
@@ -24,9 +24,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If call come from an old leader, disregard.
 	if args.Term < rf.currentTerm {
-		rf.mu.Unlock()
-		rf.DebugLog("Call from old leader, reply false.")
-		rf.mu.Lock()
+		rf.DebugLogWithLock("Call from old leader, reply false.")
 		return
 	}
 	rf.currentTerm = args.Term
@@ -37,9 +35,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// If previous entry does not match, reply false.
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		rf.mu.Unlock()
-		rf.DebugLog("Previous entry does not match, reply false.")
-		rf.mu.Lock()
+		rf.DebugLogWithLock("Previous entry does not match, reply false.")
 		return
 	}
 
@@ -58,14 +54,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 
-	rf.mu.Unlock()
-	rf.DebugLog("Updated log starting from %d", index)
+	rf.DebugLogWithLock("Updated log starting from %d", index)
 	rf.apply()
-	rf.mu.Lock()
+	rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	rf.DebugLog("sendAppendEntries(%d, %v)", server, *args)
+	rf.DebugLogNoLock("sendAppendEntries(%d, %v)", server, *args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -73,7 +68,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) startAppendEntries() {
 	for i := range rf.peers {
 		if i != rf.me {
-			go func() {
+			go func(i int) {
 				args := AppendEntriesArgs{}
 				reply := AppendEntriesReply{}
 
@@ -84,7 +79,8 @@ func (rf *Raft) startAppendEntries() {
 					args.LeaderCommit = rf.commitIndex
 					args.PrevLogIndex = rf.nextIndex[i] - 1
 					args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-					args.Entries = rf.log[args.PrevLogIndex+1:]
+					args.Entries = make([]LogEntry, len(rf.log)-args.PrevLogIndex-1) // Deep copy entries to prevent race in RPC encoding
+					copy(args.Entries, rf.log[args.PrevLogIndex+1:])
 					rf.mu.Unlock()
 
 					if !rf.sendAppendEntries(i, &args, &reply) {
@@ -96,24 +92,29 @@ func (rf *Raft) startAppendEntries() {
 						break
 					}
 					if reply.Success {
-						rf.DebugLog("Received successful AppendEntriesReply from %d", i)
+						rf.DebugLogNoLock("Received successful AppendEntriesReply from %d", i)
 						rf.mu.Lock()
 						rf.matchindex[i] = len(rf.log) - 1 // All logs are updated successfully
 						rf.nextIndex[i] = len(rf.log)
 						rf.mu.Unlock()
 						break
 					} else {
-						rf.DebugLog("Received failed AppendEntriesReply from %d, retry.", i)
+						rf.DebugLogNoLock("Received failed AppendEntriesReply from %d, retry.", i)
 						rf.mu.Lock()
-						rf.nextIndex[i]-- // Decrease and retry
+						if rf.nextIndex[i] > 1 {
+							rf.nextIndex[i]-- // Decrease and retry
+						}
 						rf.mu.Unlock()
 					}
 				}
 				rf.mu.Lock()
-				rf.commitIndex = getCommittedIndex(rf.matchindex)
-				rf.mu.Unlock()
+				commitIndex := getCommittedIndex(rf.matchindex)
+				if rf.log[commitIndex].Term == rf.currentTerm {
+					rf.commitIndex = commitIndex
+				}
 				rf.apply()
-			}()
+				rf.mu.Unlock()
+			}(i)
 		}
 	}
 }

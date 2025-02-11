@@ -27,7 +27,7 @@ func (formatter *raftFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 }
 
 func initLog() {
-	fd, err := os.OpenFile("raft.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	fd, err := os.OpenFile("raft.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		panic("Can't open log file")
 	}
@@ -37,9 +37,13 @@ func initLog() {
 	logrus.SetFormatter(&raftFormatter{})
 }
 
-func (rf *Raft) DebugLog(format string, args ...interface{}) {
+func (rf *Raft) DebugLogNoLock(format string, args ...interface{}) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	rf.DebugLogWithLock(format, args...)
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) DebugLogWithLock(format string, args ...interface{}) {
 	color_scheme := FOLLOWER_COLOR
 	switch rf.state {
 	case leader:
@@ -49,5 +53,5 @@ func (rf *Raft) DebugLog(format string, args ...interface{}) {
 	}
 	_, file, line, _ := runtime.Caller(1)
 	logrus.Debugf("%s:%d\t%s%d(%d)%s:%s", path.Base(file), line, color_scheme, rf.me, rf.currentTerm, NORMAL_COLOR, fmt.Sprintf(format, args...))
-	// logrus.Debugf("%v", rf.log)
+	logrus.Tracef("%v", rf.log)
 }

@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"lab/src/labgob"
 	"lab/src/labrpc"
 	"sync"
 	"sync/atomic"
@@ -48,7 +50,7 @@ const (
 	minTimeout       int          = 200 // Milliseconds
 	maxTimeout       int          = 400
 	heartbeatTimeout int          = 150
-	logLevel         logrus.Level = logrus.InfoLevel
+	logLevel         logrus.Level = logrus.TraceLevel
 )
 
 type ApplyMsg struct {
@@ -76,7 +78,7 @@ type Raft struct {
 
 	// Persistent state on ALL servers
 	currentTerm int        // Latest term server has seen
-	votedFor    any        // CandidateId that received vote in current term
+	votedFor    int        // CandidateId that received vote in current term, -1 for not voted
 	log         []LogEntry // Log entries
 	state       state      // Follower, candidate or leader
 
@@ -100,6 +102,9 @@ type Raft struct {
 
 	// Apply Message
 	applyCh chan ApplyMsg
+
+	// Kill Signal
+	killSig chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -117,15 +122,16 @@ func (rf *Raft) GetState() (term int, isLeader bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// persist() must be inside critical zone to guarentee the correctness
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.state)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -135,17 +141,27 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	rf.DebugLogNoLock("Read persist")
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	var state state
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil ||
+		d.Decode(&state) != nil {
+		panic("Read persist error!")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+		rf.state = state
+		for i := range rf.nextIndex {
+			rf.nextIndex[i] = len(rf.log)
+		}
+	}
 }
 
 // Append entries and heartbeat RPC
@@ -163,7 +179,7 @@ func (rf *Raft) readPersist(data []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command any) (index int, term int, isLeader bool) {
-	rf.DebugLog("Start()")
+	rf.DebugLogNoLock("Start(%v)", command)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -183,6 +199,7 @@ func (rf *Raft) Start(command any) (index int, term int, isLeader bool) {
 	rf.matchindex[rf.me] = len(rf.log) - 1
 
 	// Append entries immediately.
+	rf.persist()
 	rf.mu.Unlock()
 	rf.startAppendEntries()
 	rf.mu.Lock()
@@ -201,7 +218,12 @@ func (rf *Raft) Start(command any) (index int, term int, isLeader bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
+	rf.DebugLogNoLock("Killed!")
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.persist()
+	close(rf.killSig)
 	// Your code here, if desired.
 }
 
@@ -243,13 +265,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchindex = make([]int, len(peers))
 	// Apply Message
 	rf.applyCh = applyCh
+	// Kill Signal
+	rf.killSig = make(chan struct{})
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	go rf.stateHandler()
 	go rf.electionHandler()
 	go rf.heartbeatHandler()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
@@ -258,15 +282,16 @@ func (rf *Raft) stateHandler() {
 	for {
 		select {
 		case <-rf.turnFollowerCh:
-			rf.DebugLog("Turn follower")
+			rf.DebugLogNoLock("Turn follower")
 			rf.mu.Lock()
 			rf.state = follower
-			rf.votedFor = nil
+			rf.votedFor = -1
 			rf.electionTimer.Reset(rf.electionTimeout)
 			rf.heartbeatTimer.Stop()
+			rf.persist()
 			rf.mu.Unlock()
 		case <-rf.turnLeaderCh:
-			rf.DebugLog("Turn leader")
+			rf.DebugLogNoLock("Turn leader")
 			rf.mu.Lock()
 			rf.state = leader
 			rf.electionTimer.Stop()
@@ -275,22 +300,22 @@ func (rf *Raft) stateHandler() {
 				rf.nextIndex[i] = len(rf.log)
 				rf.matchindex[i] = 0
 			}
+			rf.persist()
 			rf.mu.Unlock()
+		case <-rf.killSig:
+			return
 		}
 	}
 }
 
+// must be inside critical zone to prevent from out-of-order call
 func (rf *Raft) apply() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyCh <- ApplyMsg{true, rf.log[i].Command, i}
 	}
 	if rf.lastApplied < rf.commitIndex {
 		from, to := rf.lastApplied+1, rf.commitIndex
-		rf.mu.Unlock()
-		rf.DebugLog("Applied %d ~ %d", from, to)
-		rf.mu.Lock()
+		rf.DebugLogWithLock("Applied %d ~ %d", from, to)
 	}
 	rf.lastApplied = rf.commitIndex
 }
