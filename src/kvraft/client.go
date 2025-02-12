@@ -8,7 +8,7 @@ import (
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	// TODO: You will have to modify this struct.
 }
 
 func nrand() int64 {
@@ -21,7 +21,7 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	// TODO: You'll have to add code here.
 	return ck
 }
 
@@ -37,7 +37,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 
-	// You will have to modify this function.
+	// TODO: You will have to modify this function.
 	return ""
 }
 
@@ -50,7 +50,7 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	// TODO: You will have to modify this function.
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -4,22 +4,12 @@ import (
 	"lab/src/labgob"
 	"lab/src/labrpc"
 	"lab/src/raft"
-	"log"
 	"sync"
 	"sync/atomic"
 )
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
 type Op struct {
-	// Your definitions here.
+	// TODO: Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
@@ -33,15 +23,16 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	// TODO: Your definitions here.
+	db map[string]string // will be updated and read when applyCh arrives
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	// TODO: Your code here.
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	// TODO: Your code here.
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -55,7 +46,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
+	// TODO: Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -80,11 +71,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
+	initLog()
+
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
+	// TODO: You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
