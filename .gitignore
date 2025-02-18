@@ -9,3 +9,5 @@ mr-*
 *.log
 *.err
 tester
+profile/
+.vscode

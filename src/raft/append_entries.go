@@ -15,9 +15,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.DebugLogNoLock("AppendEntries(%v)", *args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.DebugLogWithLock("AppendEntries(%v)", *args)
 	rf.electionTimer.Reset(rf.electionTimeout)
 	reply.Term = rf.currentTerm
 	reply.Success = false

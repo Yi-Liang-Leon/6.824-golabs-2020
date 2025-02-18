@@ -24,8 +24,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // import "bytes"
@@ -47,10 +45,9 @@ const (
 	follower state = iota
 	candidate
 	leader
-	minTimeout       int          = 200 // Milliseconds
-	maxTimeout       int          = 400
-	heartbeatTimeout int          = 150
-	logLevel         logrus.Level = logrus.TraceLevel
+	minTimeout       int = 200 // Milliseconds
+	maxTimeout       int = 400
+	heartbeatTimeout int = 150
 )
 
 type ApplyMsg struct {
@@ -310,6 +307,7 @@ func (rf *Raft) stateHandler() {
 
 // must be inside critical zone to prevent from out-of-order call
 func (rf *Raft) apply() {
+	rf.DebugLogWithLock("Apply(%d,%d)", rf.lastApplied+1, rf.commitIndex) //TODO:DELETE
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		rf.applyCh <- ApplyMsg{true, rf.log[i].Command, i}
 	}
@@ -318,4 +316,5 @@ func (rf *Raft) apply() {
 		rf.DebugLogWithLock("Applied %d ~ %d", from, to)
 	}
 	rf.lastApplied = rf.commitIndex
+	rf.DebugLogWithLock("Apply() return") //TODO:DELETE
 }

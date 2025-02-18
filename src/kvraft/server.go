@@ -6,13 +6,10 @@ import (
 	"lab/src/raft"
 	"sync"
 	"sync/atomic"
-)
+	"time"
 
-type Op struct {
-	// TODO: Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-}
+	"github.com/sirupsen/logrus"
+)
 
 type KVServer struct {
 	mu      sync.Mutex
@@ -20,19 +17,95 @@ type KVServer struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
+	killSig chan struct{}
 
 	maxraftstate int // snapshot if log grows this big
 
 	// TODO: Your definitions here.
 	db map[string]string // will be updated and read when applyCh arrives
+
+	// Channel dispatcher to certain client call based on log index
+	clientCallChs map[int]chan ClientMsg
+
+	// For idempotent calling
+	previousGetReplys map[ClientCallID]string
+	previousPutAppend map[ClientCallID]struct{}
+
+	// For logging
+	logger logrus.Logger
+	once   sync.Once
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// TODO: Your code here.
+	kv.mu.Lock()
+	kv.LogServerWithLock("Get(%v)", args)
+
+	// If replied before
+	if prevReply, ok := kv.previousGetReplys[args.Id]; ok {
+		reply.Err = OK
+		reply.Value = prevReply
+		return
+	}
+	command := Command{GET, args.Key, ""}
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader { // If isn't leader return directly
+		reply.Err = ErrWrongLeader
+		return
+	}
+	timer := time.NewTimer(MAX_TIMEOUT)
+	callCh := make(chan ClientMsg)
+	kv.clientCallChs[index] = callCh // Attach channel to dispatcher
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-callCh:
+		reply.Err = msg.Err
+		reply.Value = msg.Value
+		kv.previousGetReplys[args.Id] = msg.Value
+		delete(kv.clientCallChs, index)
+		return
+	case <-timer.C:
+		reply.Err = ErrTimeout
+		return
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// TODO: Your code here.
+	kv.mu.Lock()
+	kv.LogServerWithLock("PutAppend(%v)", args)
+
+	// If replied before
+	if _, ok := kv.previousPutAppend[args.Id]; ok {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	command := Command{args.Op, args.Key, args.Value}
+	index, _, isLeader := kv.rf.Start(command)
+	if !isLeader { // If isn't leader return directly
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+	timer := time.NewTimer(MAX_TIMEOUT)
+	callCh := make(chan ClientMsg)
+	kv.clientCallChs[index] = callCh // Attach channel to dispatcher
+	kv.mu.Unlock()
+
+	select {
+	case msg := <-callCh:
+		kv.LogServerNoLock("PutAppend(%v) ok to return", args)
+		reply.Err = msg.Err
+		delete(kv.clientCallChs, index)
+		return
+	case <-timer.C:
+		kv.LogServerNoLock("PutAppend(%v) timeout", args)
+		reply.Err = ErrTimeout
+		delete(kv.clientCallChs, index)
+		return
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -45,6 +118,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
+	kv.LogServerNoLock("KILLED!")
+	close(kv.killSig)
 	kv.rf.Kill()
 	// TODO: Your code here, if desired.
 }
@@ -68,21 +143,68 @@ func (kv *KVServer) killed() bool {
 // for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
-
-	initLog()
+	// Go's RPC library to marshall/unmarshall
+	labgob.Register(Command{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.db = make(map[string]string)
+	kv.previousGetReplys = make(map[ClientCallID]string)
+	kv.clientCallChs = make(map[int]chan ClientMsg)
 
 	// TODO: You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.killSig = make(chan struct{})
 
 	// You may need initialization code here.
+	kv.once.Do(kv.initLog)
+	kv.LogServerNoLock("Starting server %d", me)
+
+	go kv.applyHandler()
 
 	return kv
+}
+
+func (kv *KVServer) applyHandler() {
+	for {
+		select {
+		case <-kv.killSig:
+			return
+		case applyMsg := <-kv.applyCh:
+			command := applyMsg.Command.(Command)
+			var msg ClientMsg
+			switch command.Op {
+			case GET:
+				kv.mu.Lock()
+				kv.LogServerWithLock("Received applyMsg GET(%s)", command.Key)
+				value, ok := kv.db[command.Key]
+				if !ok {
+					msg.Err = ErrNoKey
+				} else {
+					msg.Err = OK
+					msg.Value = value
+				}
+				if _, ok := kv.clientCallChs[applyMsg.CommandIndex]; ok {
+					kv.clientCallChs[applyMsg.CommandIndex] <- msg
+				}
+				kv.mu.Unlock()
+			case PUT, APPEND:
+				kv.mu.Lock()
+				kv.LogServerWithLock("Received applyMsg %s(%s,%s)", command.Op, command.Key, command.Value)
+				if command.Op == PUT {
+					kv.db[command.Key] = command.Value
+				} else {
+					kv.db[command.Key] += command.Value
+				}
+				msg.Err = OK
+				if _, ok := kv.clientCallChs[applyMsg.CommandIndex]; ok {
+					kv.clientCallChs[applyMsg.CommandIndex] <- msg
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
 }
